@@ -1,0 +1,28 @@
+{
+  "description": "Play a song when Claude finishes; stop it when you press Space or send the next prompt.",
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/claude-song\" play >/dev/null 2>&1 || true",
+            "async": true,
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/claude-song\" stop >/dev/null 2>&1 || true",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

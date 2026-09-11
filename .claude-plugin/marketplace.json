@@ -1,0 +1,14 @@
+{
+  "name": "claude-song",
+  "description": "A song plays when Claude Code finishes a task, until you press Space.",
+  "owner": {
+    "name": "Bharat Verma"
+  },
+  "plugins": [
+    {
+      "name": "claude-song",
+      "source": "./",
+      "description": "Plays your favourite song when Claude Code finishes a task, until you press Space."
+    }
+  ]
+}

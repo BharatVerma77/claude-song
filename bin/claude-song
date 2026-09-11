@@ -1,0 +1,184 @@
+#!/bin/bash
+# claude-song — plays a song when Claude Code finishes, until you press Space.
+#
+#   claude-song set <file-or-name>   choose the song: a path, or part of a filename in the songs folder
+#   claude-song add <file>           copy a file into the songs folder and select it
+#   claude-song play                 start the song + "Claude Code is done" window   (run by the Stop hook)
+#   claude-song stop                 stop the song                                    (run by the UserPromptSubmit hook)
+#   claude-song status               show the current song and whether it is playing
+#   claude-song list                 list the songs folder
+#   claude-song off | on             pause / resume the alert without uninstalling
+#   claude-song config               print the settings file path
+#
+# Data lives in ~/.claude/claude-song  (song.conf, songs/, bin/)
+
+SELF="${BASH_SOURCE[0]}"
+while [ -L "$SELF" ]; do SELF="$(readlink "$SELF")"; done
+BIN="$(cd "$(dirname "$SELF")" && pwd)"
+
+APP="$HOME/.claude/claude-song"
+CONF="$APP/song.conf"
+SONGS="$APP/songs"
+RUN="$APP/.run"
+LOG="$APP/.last-dialog.log"
+SOUNDS=/System/Library/Sounds
+MARK="claude-song _player"       # every player/loop process carries this command line
+TITLE="Claude Code is done"
+
+load_conf() {
+  SONG="default-jingle"; VOLUME=1; LOOP=1; MAX_MINUTES=0
+  [ -f "$CONF" ] && . "$CONF"
+  SONG="${SONG/#\~/$HOME}"
+}
+
+save_conf() {
+  mkdir -p "$APP"
+  cat > "$CONF" <<CONF_EOF
+# claude-song settings. Edit freely, or run: claude-song set <file-or-name>
+# SONG can be a full path to an audio file, or just part of a filename
+# to look for inside $SONGS (case-insensitive).
+SONG="$SONG"
+VOLUME=$VOLUME          # 1 = normal, 0.5 = half, 2 = louder
+LOOP=$LOOP            # 1 = repeat the song until you press Space, 0 = play once
+MAX_MINUTES=$MAX_MINUTES     # safety cap in minutes; 0 = keep playing until dismissed
+CONF_EOF
+}
+
+# Resolve SONG to an actual file. Prints the path, or nothing if not found.
+resolve_song() {
+  [ -z "$SONG" ] && return 1
+  if [ -f "$SONG" ]; then printf '%s\n' "$SONG"; return 0; fi
+  find "$SONGS" -maxdepth 1 -type f -iname "*${SONG}*" \
+    \( -iname '*.mp3' -o -iname '*.m4a' -o -iname '*.aac' -o -iname '*.wav' -o -iname '*.aiff' -o -iname '*.aif' -o -iname '*.flac' -o -iname '*.caf' \) \
+    2>/dev/null | sort | head -n 1 | grep .
+}
+
+is_playing() { pgrep -f "$MARK" >/dev/null 2>&1; }
+
+# Kill every player + loop process and their children (afplay, window), race-free.
+do_stop() {
+  local pids kids
+  pids=$(pgrep -f "$MARK" 2>/dev/null)
+  if [ -n "$pids" ]; then
+    kill -STOP $pids 2>/dev/null                       # freeze so the loop cannot respawn afplay
+    kids=$(for p in $pids; do pgrep -P "$p"; done)
+    [ -n "$kids" ] && kill -TERM $kids 2>/dev/null     # afplay + window
+    kill -TERM $pids 2>/dev/null; kill -CONT $pids 2>/dev/null
+  fi
+  rm -rf "$RUN"
+}
+
+do_play() {
+  [ -e "$APP/off" ] && exit 0
+  do_stop
+  mkdir -p "$RUN"
+  # Run the player in its own session so it outlives the hook that started it,
+  # then wait (up to 3 s) until it confirms it is running before returning.
+  perl -e 'use POSIX; POSIX::setsid(); exec @ARGV' -- "$BIN/claude-song" _player </dev/null >/dev/null 2>&1 &
+  disown 2>/dev/null
+  local i=0
+  while [ ! -f "$RUN/player.pid" ] && [ $i -lt 60 ]; do sleep 0.05; i=$((i+1)); done
+}
+
+# Build the native Space-key window from source if the Xcode tools are present.
+compile_dialog() {
+  xcode-select -p >/dev/null 2>&1 || return 1
+  command -v swiftc >/dev/null 2>&1 || return 1
+  [ -f "$BIN/song-dialog.swift" ] || return 1
+  mkdir -p "$APP/bin"
+  swiftc -swift-version 5 -suppress-warnings -O -framework AppKit \
+    -o "$APP/bin/song-dialog.tmp" "$BIN/song-dialog.swift" >/dev/null 2>&1 \
+    && mv -f "$APP/bin/song-dialog.tmp" "$APP/bin/song-dialog"
+}
+
+# Show the "done" window and block until it is dismissed.
+# Order: locally compiled window -> prebuilt window shipped with the app -> AppleScript dialog (Enter only).
+show_window() {
+  local msg="$1" secs="$2" d
+  [ -x "$APP/bin/song-dialog" ] || compile_dialog
+  for d in "$APP/bin/song-dialog" "$BIN/song-dialog"; do
+    [ -x "$d" ] || continue
+    if "$d" "$msg" "$TITLE" "$secs" >/dev/null 2>"$LOG"; then return 0; fi
+  done
+  osascript "$BIN/song-dialog.applescript" "$msg" "$TITLE" "$secs" >/dev/null 2>&1
+}
+
+do_player() {
+  load_conf
+  mkdir -p "$RUN"
+  echo $$ > "$RUN/player.pid"   # signals do_play that we are detached and running
+  local file msg
+  file=$(resolve_song)
+  if [ -n "$file" ]; then
+    (
+      while :; do
+        afplay -v "$VOLUME" "$file" & wait $!
+        [ "$LOOP" = "1" ] || break
+      done
+    ) &
+    msg="Now playing: $(basename "$file")
+
+Press Space or Enter to stop the music."
+  else
+    ( afplay "$SOUNDS/Glass.aiff"; afplay "$SOUNDS/Hero.aiff" ) &
+    msg="No song file found for: ${SONG:-<none set>}
+
+Run:  claude-song add <your-song.mp3>"
+  fi
+  local secs=31536000
+  [ "${MAX_MINUTES:-0}" -gt 0 ] 2>/dev/null && secs=$((MAX_MINUTES * 60))
+  show_window "$msg" "$secs"
+  do_stop   # window dismissed (Space / Enter / Esc / click / timeout): stop everything, including this loop
+}
+
+do_set() {
+  local arg="$1"
+  [ -z "$arg" ] && { echo "usage: claude-song set <audio file, or part of a filename in $SONGS>"; exit 1; }
+  load_conf
+  arg="${arg/#\~/$HOME}"
+  if [ -f "$arg" ]; then
+    arg="$(cd "$(dirname "$arg")" && pwd)/$(basename "$arg")"
+    afinfo "$arg" >/dev/null 2>&1 || { echo "macOS cannot play this file: $arg"; exit 1; }
+    SONG="$arg"
+  else
+    SONG="$arg"
+    resolve_song >/dev/null || echo "note: nothing in $SONGS matches \"$arg\" yet. Add a file there and it will be picked up."
+  fi
+  save_conf
+  echo "Song set to: $SONG"
+  local f; f=$(resolve_song) && echo "Resolves to: $f"
+}
+
+do_add() {
+  local f="${1/#\~/$HOME}"
+  [ -f "$f" ] || { echo "usage: claude-song add <audio file>"; exit 1; }
+  afinfo "$f" >/dev/null 2>&1 || { echo "macOS cannot play this file: $f"; exit 1; }
+  mkdir -p "$SONGS"
+  cp "$f" "$SONGS/"
+  do_set "$SONGS/$(basename "$f")"
+}
+
+do_status() {
+  load_conf
+  echo "Setting : SONG=\"$SONG\"  VOLUME=$VOLUME  LOOP=$LOOP  MAX_MINUTES=$MAX_MINUTES"
+  local f; f=$(resolve_song) && echo "File    : $f" || echo "File    : NOT FOUND (will play a short chime instead)"
+  if [ -x "$APP/bin/song-dialog" ] || [ -x "$BIN/song-dialog" ]; then echo "Window  : native (Space / Enter / Esc stop it)"; else echo "Window  : AppleScript fallback (Enter stops it)"; fi
+  [ -e "$APP/off" ] && echo "Alert   : OFF (run 'claude-song on' to enable)"
+  if is_playing; then echo "Playing : yes (press Space on the window, or run 'claude-song stop')"; else echo "Playing : no"; fi
+}
+
+do_list() { echo "Songs in $SONGS:"; ls -1 "$SONGS" 2>/dev/null || true; }
+
+case "$1" in
+  play|test)  do_play ;;
+  _player)    do_player ;;
+  stop)       do_stop ;;
+  set)        do_set "$2" ;;
+  add)        do_add "$2" ;;
+  status)     do_status ;;
+  list)       do_list ;;
+  off)        mkdir -p "$APP"; touch "$APP/off"; do_stop; echo "claude-song is OFF. Run 'claude-song on' to enable." ;;
+  on)         rm -f "$APP/off"; echo "claude-song is ON." ;;
+  config)     echo "$CONF" ;;
+  *)          sed -n '2,13p' "$0"; exit 1 ;;
+esac

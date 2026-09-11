@@ -1,0 +1,8 @@
+{
+  "name": "claude-song",
+  "version": "1.0.0",
+  "description": "Plays your favourite song when Claude Code finishes a task, and keeps playing until you press Space.",
+  "author": { "name": "Bharat Verma" },
+  "homepage": "https://github.com/BharatVerma77/claude-song",
+  "license": "MIT"
+}
