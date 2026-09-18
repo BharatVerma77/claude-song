@@ -49,16 +49,32 @@ claude-song status
 Any file macOS can play works: mp3, m4a, wav, aiff, flac. A short royalty-free jingle is included so it works
 out of the box.
 
+## A whole playlist instead of one song
+
+Add as many songs as you want, then turn on shuffle. Every time Claude finishes, a different one plays —
+never the same song twice in a row.
+
+```bash
+claude-song add ~/Downloads/song-one.mp3
+claude-song add ~/Downloads/song-two.mp3
+claude-song add ~/Downloads/song-three.mp3
+claude-song shuffle on
+```
+
+`claude-song status` shows how many songs are in rotation and which one played last.
+`claude-song shuffle off` goes back to always playing one fixed song.
+
 ## Commands
 
 | Command | What it does |
 |---|---|
 | `claude-song play` | Start the song and the window (this is what the Stop hook runs) |
 | `claude-song stop` | Stop the song (this is what the UserPromptSubmit hook runs) |
-| `claude-song add <file>` | Copy a song into the songs folder and select it |
-| `claude-song set <file-or-name>` | Select a song by path, or by part of a filename in the songs folder |
+| `claude-song add <file>` | Copy a song into the songs folder |
+| `claude-song set <file-or-name>` | Play one fixed song, by path or by part of a filename in the songs folder |
+| `claude-song shuffle on` / `off` | Rotate a different song every time, instead of one fixed song |
 | `claude-song list` | List the songs folder |
-| `claude-song status` | Current song, window type, playing or not |
+| `claude-song status` | Current song or shuffle state, window type, playing or not |
 | `claude-song off` / `on` | Pause or resume the alert without uninstalling |
 | `claude-song config` | Print the settings file path |
 
@@ -67,10 +83,11 @@ out of the box.
 `~/.claude/claude-song/song.conf`:
 
 ```bash
-SONG="moonrise"     # a path, or part of a filename inside the songs folder
+SONG="moonrise"     # a path, or part of a filename inside the songs folder (ignored while SHUFFLE=1)
 VOLUME=1            # 1 = normal, 0.5 = half, 2 = louder
-LOOP=1              # 1 = repeat until you press Space, 0 = play once
+LOOP=1              # 1 = repeat the current song until you press Space, 0 = play once
 MAX_MINUTES=0       # safety cap in minutes; 0 = keep playing until dismissed
+SHUFFLE=0           # 1 = pick a different song from the songs folder every time, 0 = always play SONG
 ```
 
 ## How it works

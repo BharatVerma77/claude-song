@@ -1,11 +1,12 @@
 #!/bin/bash
 # claude-song — plays a song when Claude Code finishes, until you press Space.
 #
-#   claude-song set <file-or-name>   choose the song: a path, or part of a filename in the songs folder
+#   claude-song set <file-or-name>   choose one fixed song: a path, or part of a filename in the songs folder
 #   claude-song add <file>           copy a file into the songs folder and select it
+#   claude-song shuffle [on|off]     rotate a different song from the songs folder every time (never the same twice in a row)
 #   claude-song play                 start the song + "Claude Code is done" window   (run by the Stop hook)
 #   claude-song stop                 stop the song                                    (run by the UserPromptSubmit hook)
-#   claude-song status               show the current song and whether it is playing
+#   claude-song status               show the current song / shuffle state and whether it is playing
 #   claude-song list                 list the songs folder
 #   claude-song off | on             pause / resume the alert without uninstalling
 #   claude-song config               print the settings file path
@@ -21,12 +22,14 @@ CONF="$APP/song.conf"
 SONGS="$APP/songs"
 RUN="$APP/.run"
 LOG="$APP/.last-dialog.log"
+LASTSONG="$APP/.last-song"
 SOUNDS=/System/Library/Sounds
 MARK="claude-song _player"       # every player/loop process carries this command line
 TITLE="Claude Code is done"
+EXTS_ARGS=(-iname '*.mp3' -o -iname '*.m4a' -o -iname '*.aac' -o -iname '*.wav' -o -iname '*.aiff' -o -iname '*.aif' -o -iname '*.flac' -o -iname '*.caf')
 
 load_conf() {
-  SONG="default-jingle"; VOLUME=1; LOOP=1; MAX_MINUTES=0
+  SONG="default-jingle"; VOLUME=1; LOOP=1; MAX_MINUTES=0; SHUFFLE=0
   [ -f "$CONF" ] && . "$CONF"
   SONG="${SONG/#\~/$HOME}"
 }
@@ -34,23 +37,55 @@ load_conf() {
 save_conf() {
   mkdir -p "$APP"
   cat > "$CONF" <<CONF_EOF
-# claude-song settings. Edit freely, or run: claude-song set <file-or-name>
+# claude-song settings. Edit freely, or run: claude-song set <file-or-name> / claude-song shuffle on
 # SONG can be a full path to an audio file, or just part of a filename
-# to look for inside $SONGS (case-insensitive).
+# to look for inside $SONGS (case-insensitive). Ignored while SHUFFLE=1.
 SONG="$SONG"
 VOLUME=$VOLUME          # 1 = normal, 0.5 = half, 2 = louder
-LOOP=$LOOP            # 1 = repeat the song until you press Space, 0 = play once
+LOOP=$LOOP            # 1 = repeat the current song until you press Space, 0 = play once
 MAX_MINUTES=$MAX_MINUTES     # safety cap in minutes; 0 = keep playing until dismissed
+SHUFFLE=$SHUFFLE          # 1 = pick a different song from $SONGS every time, 0 = always play SONG
 CONF_EOF
+}
+
+# All playable files sitting in the songs folder, one per line.
+all_songs() {
+  find "$SONGS" -maxdepth 1 -type f \( "${EXTS_ARGS[@]}" \) 2>/dev/null | sort
 }
 
 # Resolve SONG to an actual file. Prints the path, or nothing if not found.
 resolve_song() {
   [ -z "$SONG" ] && return 1
   if [ -f "$SONG" ]; then printf '%s\n' "$SONG"; return 0; fi
-  find "$SONGS" -maxdepth 1 -type f -iname "*${SONG}*" \
-    \( -iname '*.mp3' -o -iname '*.m4a' -o -iname '*.aac' -o -iname '*.wav' -o -iname '*.aiff' -o -iname '*.aif' -o -iname '*.flac' -o -iname '*.caf' \) \
+  find "$SONGS" -maxdepth 1 -type f -iname "*${SONG}*" \( "${EXTS_ARGS[@]}" \) \
     2>/dev/null | sort | head -n 1 | grep .
+}
+
+# Pick the next song for shuffle mode: never the same file two plays in a row
+# (unless it's the only one), and remember the pick so the next play differs.
+resolve_shuffle_pick() {
+  local pool count last pick tries=0
+  pool=$(all_songs | grep -v '/default-jingle\.wav$')
+  [ -z "$pool" ] && pool=$(all_songs)   # nothing but the bundled jingle: use it
+  [ -z "$pool" ] && return 1
+  count=$(printf '%s\n' "$pool" | grep -c .)
+  last=""; [ -f "$LASTSONG" ] && last=$(cat "$LASTSONG" 2>/dev/null)
+  if [ "$count" -le 1 ]; then
+    pick=$(printf '%s\n' "$pool" | head -1)
+  else
+    # $RANDOM reseeds per bash process (this script is re-exec'd fresh each play),
+    # unlike awk's srand() which reseeds from the current second and repeats
+    # within the same second on rapid back-to-back plays.
+    local idx
+    while [ $tries -lt 10 ]; do
+      idx=$(( (RANDOM * 32768 + RANDOM) % count + 1 ))
+      pick=$(printf '%s\n' "$pool" | sed -n "${idx}p")
+      [ "$pick" != "$last" ] && break
+      tries=$((tries + 1))
+    done
+  fi
+  printf '%s\n' "$pick" > "$LASTSONG"
+  printf '%s\n' "$pick"
 }
 
 is_playing() { pgrep -f "$MARK" >/dev/null 2>&1; }
@@ -108,7 +143,7 @@ do_player() {
   mkdir -p "$RUN"
   echo $$ > "$RUN/player.pid"   # signals do_play that we are detached and running
   local file msg
-  file=$(resolve_song)
+  if [ "$SHUFFLE" = "1" ]; then file=$(resolve_shuffle_pick); else file=$(resolve_song); fi
   if [ -n "$file" ]; then
     (
       while :; do
@@ -116,9 +151,16 @@ do_player() {
         [ "$LOOP" = "1" ] || break
       done
     ) &
-    msg="Now playing: $(basename "$file")
+    if [ "$SHUFFLE" = "1" ]; then
+      msg="Now playing: $(basename "$file")
+(shuffling — a different song plays next time)
 
 Press Space or Enter to stop the music."
+    else
+      msg="Now playing: $(basename "$file")
+
+Press Space or Enter to stop the music."
+    fi
   else
     ( afplay "$SOUNDS/Glass.aiff"; afplay "$SOUNDS/Hero.aiff" ) &
     msg="No song file found for: ${SONG:-<none set>}
@@ -144,6 +186,7 @@ do_set() {
     SONG="$arg"
     resolve_song >/dev/null || echo "note: nothing in $SONGS matches \"$arg\" yet. Add a file there and it will be picked up."
   fi
+  SHUFFLE=0
   save_conf
   echo "Song set to: $SONG"
   local f; f=$(resolve_song) && echo "Resolves to: $f"
@@ -155,19 +198,60 @@ do_add() {
   afinfo "$f" >/dev/null 2>&1 || { echo "macOS cannot play this file: $f"; exit 1; }
   mkdir -p "$SONGS"
   cp "$f" "$SONGS/"
-  do_set "$SONGS/$(basename "$f")"
+  load_conf
+  if [ "$SHUFFLE" = "1" ]; then
+    echo "Added to the shuffle folder: $(basename "$f")"
+    local n; n=$(all_songs | grep -v '/default-jingle\.wav$' | grep -c .)
+    echo "Now rotating through $n song(s). Add more any time, or 'claude-song shuffle off' to pin one."
+  else
+    do_set "$SONGS/$(basename "$f")"
+  fi
+}
+
+do_shuffle() {
+  load_conf
+  case "$1" in
+    ""|status)
+      ;;
+    on)  SHUFFLE=1; save_conf; rm -f "$LASTSONG" ;;
+    off) SHUFFLE=0; save_conf ;;
+    *)   echo "usage: claude-song shuffle [on|off]"; exit 1 ;;
+  esac
+  load_conf
+  local n; n=$(all_songs | grep -v '/default-jingle\.wav$' | grep -c .)
+  if [ "$SHUFFLE" = "1" ]; then
+    echo "Shuffle is ON — a different song from $SONGS plays every time ($n in rotation)."
+    [ "$n" -eq 0 ] && echo "Nothing there yet: claude-song add <song.mp3>  (repeat for each song)"
+  else
+    echo "Shuffle is OFF — always plays: $SONG"
+    echo "Turn it on with: claude-song shuffle on"
+  fi
 }
 
 do_status() {
   load_conf
-  echo "Setting : SONG=\"$SONG\"  VOLUME=$VOLUME  LOOP=$LOOP  MAX_MINUTES=$MAX_MINUTES"
-  local f; f=$(resolve_song) && echo "File    : $f" || echo "File    : NOT FOUND (will play a short chime instead)"
+  if [ "$SHUFFLE" = "1" ]; then
+    local n last; n=$(all_songs | grep -v '/default-jingle\.wav$' | grep -c .)
+    echo "Setting : SHUFFLE ON — rotating $n song(s) in $SONGS"
+    [ -f "$LASTSONG" ] && { last=$(cat "$LASTSONG"); echo "Last    : $(basename "$last")"; }
+    echo "          VOLUME=$VOLUME  LOOP=$LOOP  MAX_MINUTES=$MAX_MINUTES"
+  else
+    echo "Setting : SONG=\"$SONG\"  VOLUME=$VOLUME  LOOP=$LOOP  MAX_MINUTES=$MAX_MINUTES"
+    local f; f=$(resolve_song) && echo "File    : $f" || echo "File    : NOT FOUND (will play a short chime instead)"
+  fi
   if [ -x "$APP/bin/song-dialog" ] || [ -x "$BIN/song-dialog" ]; then echo "Window  : native (Space / Enter / Esc stop it)"; else echo "Window  : AppleScript fallback (Enter stops it)"; fi
   [ -e "$APP/off" ] && echo "Alert   : OFF (run 'claude-song on' to enable)"
   if is_playing; then echo "Playing : yes (press Space on the window, or run 'claude-song stop')"; else echo "Playing : no"; fi
 }
 
-do_list() { echo "Songs in $SONGS:"; ls -1 "$SONGS" 2>/dev/null || true; }
+do_list() {
+  load_conf
+  echo "Songs in $SONGS:"
+  all_songs | while read -r f; do
+    [ "$SHUFFLE" = "1" ] && [ "$(basename "$f")" = "default-jingle.wav" ] && [ "$(all_songs | grep -vc '/default-jingle\.wav$')" -gt 0 ] && continue
+    printf '  %s\n' "$(basename "$f")"
+  done
+}
 
 case "$1" in
   play|test)  do_play ;;
@@ -175,10 +259,11 @@ case "$1" in
   stop)       do_stop ;;
   set)        do_set "$2" ;;
   add)        do_add "$2" ;;
+  shuffle)    do_shuffle "$2" ;;
   status)     do_status ;;
   list)       do_list ;;
   off)        mkdir -p "$APP"; touch "$APP/off"; do_stop; echo "claude-song is OFF. Run 'claude-song on' to enable." ;;
   on)         rm -f "$APP/off"; echo "claude-song is ON." ;;
   config)     echo "$CONF" ;;
-  *)          sed -n '2,13p' "$0"; exit 1 ;;
+  *)          sed -n '2,14p' "$0"; exit 1 ;;
 esac
