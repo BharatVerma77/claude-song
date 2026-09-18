@@ -42,7 +42,7 @@ save_conf() {
 # to look for inside $SONGS (case-insensitive). Ignored while SHUFFLE=1.
 SONG="$SONG"
 VOLUME=$VOLUME          # 1 = normal, 0.5 = half, 2 = louder
-LOOP=$LOOP            # 1 = repeat the current song until you press Space, 0 = play once
+LOOP=$LOOP            # 1 = repeat the current song until you press Space, 0 = play once and stop on its own
 MAX_MINUTES=$MAX_MINUTES     # safety cap in minutes; 0 = keep playing until dismissed
 SHUFFLE=$SHUFFLE          # 1 = pick a different song from $SONGS every time, 0 = always play SONG
 CONF_EOF
@@ -128,13 +128,20 @@ compile_dialog() {
 
 # Show the "done" window and block until it is dismissed.
 # Order: locally compiled window -> prebuilt window shipped with the app -> AppleScript dialog (Enter only).
+# If $RUN/ended.flag appears (the song finished playing on its own with LOOP=0),
+# a killed window counts as a normal close, not a failure — no fallback is tried.
 show_window() {
-  local msg="$1" secs="$2" d
+  local msg="$1" secs="$2" d rc
   [ -x "$APP/bin/song-dialog" ] || compile_dialog
   for d in "$APP/bin/song-dialog" "$BIN/song-dialog"; do
     [ -x "$d" ] || continue
-    if "$d" "$msg" "$TITLE" "$secs" >/dev/null 2>"$LOG"; then return 0; fi
+    "$d" "$msg" "$TITLE" "$secs" >/dev/null 2>"$LOG" &
+    echo $! > "$RUN/dialog.pid"
+    wait $!; rc=$?
+    [ $rc -eq 0 ] && return 0
+    [ -f "$RUN/ended.flag" ] && return 0
   done
+  [ -f "$RUN/ended.flag" ] && return 0
   osascript "$BIN/song-dialog.applescript" "$msg" "$TITLE" "$secs" >/dev/null 2>&1
 }
 
@@ -150,6 +157,13 @@ do_player() {
         afplay -v "$VOLUME" "$file" & wait $!
         [ "$LOOP" = "1" ] || break
       done
+      if [ "$LOOP" != "1" ]; then
+        # played once all the way through and LOOP is off: close the window too,
+        # instead of leaving it open and silent until someone dismisses it.
+        touch "$RUN/ended.flag"
+        local dpid; [ -f "$RUN/dialog.pid" ] && dpid=$(cat "$RUN/dialog.pid" 2>/dev/null)
+        [ -n "$dpid" ] && kill "$dpid" 2>/dev/null
+      fi
     ) &
     if [ "$SHUFFLE" = "1" ]; then
       msg="Now playing: $(basename "$file")
@@ -161,6 +175,8 @@ Press Space or Enter to stop the music."
 
 Press Space or Enter to stop the music."
     fi
+    [ "$LOOP" != "1" ] && msg="$msg
+Plays once, then stops on its own."
   else
     ( afplay "$SOUNDS/Glass.aiff"; afplay "$SOUNDS/Hero.aiff" ) &
     msg="No song file found for: ${SONG:-<none set>}

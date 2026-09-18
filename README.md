@@ -85,10 +85,12 @@ claude-song shuffle on
 ```bash
 SONG="moonrise"     # a path, or part of a filename inside the songs folder (ignored while SHUFFLE=1)
 VOLUME=1            # 1 = normal, 0.5 = half, 2 = louder
-LOOP=1              # 1 = repeat the current song until you press Space, 0 = play once
+LOOP=1              # 1 = repeat the current song until you press Space, 0 = play once and stop on its own
 MAX_MINUTES=0       # safety cap in minutes; 0 = keep playing until dismissed
 SHUFFLE=0           # 1 = pick a different song from the songs folder every time, 0 = always play SONG
 ```
+
+Set `LOOP=0` if you'd rather it just play the song once and stop, instead of looping until you dismiss it.
 
 ## How it works
 
