@@ -1,13 +1,15 @@
 #!/bin/bash
-# claude-song — plays a song when Claude Code finishes, until you press Space.
+# claude-song — plays a song when Claude Code is finished, until you press Space.
 #
 #   claude-song set <file-or-name>   choose one fixed song: a path, or part of a filename in the songs folder
 #   claude-song add <file>           copy a file into the songs folder and select it
-#   claude-song shuffle [on|off]     rotate a different song from the songs folder every time (never the same twice in a row)
-#   claude-song play                 start the song + "Claude Code is done" window   (run by the Stop hook)
-#   claude-song stop                 stop the song                                    (run by the UserPromptSubmit hook)
-#   claude-song status               show the current song / shuffle state and whether it is playing
+#   claude-song shuffle [on|off]     rotate a different song from the songs folder every time
+#   claude-song arm                  called by the Stop hook: play once the session goes quiet
+#   claude-song play                 play right now, without waiting for quiet
+#   claude-song stop                 stop the song and cancel anything pending (run by the UserPromptSubmit hook)
+#   claude-song status               show the current song, the settings, and whether it is playing
 #   claude-song list                 list the songs folder
+#   claude-song log                  show the last few play / skip decisions
 #   claude-song off | on             pause / resume the alert without uninstalling
 #   claude-song config               print the settings file path
 #
@@ -22,14 +24,16 @@ CONF="$APP/song.conf"
 SONGS="$APP/songs"
 RUN="$APP/.run"
 LOG="$APP/.last-dialog.log"
+PLAYLOG="$APP/.play-log"
 LASTSONG="$APP/.last-song"
 SOUNDS=/System/Library/Sounds
 MARK="claude-song _player"       # every player/loop process carries this command line
+WAITMARK="claude-song _wait"     # every pending quiet-watcher carries this one
 TITLE="Claude Code is done"
 EXTS_ARGS=(-iname '*.mp3' -o -iname '*.m4a' -o -iname '*.aac' -o -iname '*.wav' -o -iname '*.aiff' -o -iname '*.aif' -o -iname '*.flac' -o -iname '*.caf')
 
 load_conf() {
-  SONG="default-jingle"; VOLUME=1; LOOP=1; MAX_MINUTES=0; SHUFFLE=0
+  SONG="default-jingle"; VOLUME=1; LOOP=0; MAX_MINUTES=0; SHUFFLE=0; QUIET_SECONDS=25; WORK_ONLY=1
   [ -f "$CONF" ] && . "$CONF"
   SONG="${SONG/#\~/$HOME}"
 }
@@ -42,11 +46,20 @@ save_conf() {
 # to look for inside $SONGS (case-insensitive). Ignored while SHUFFLE=1.
 SONG="$SONG"
 VOLUME=$VOLUME          # 1 = normal, 0.5 = half, 2 = louder
-LOOP=$LOOP            # 1 = repeat the current song until you press Space, 0 = play once and stop on its own
-MAX_MINUTES=$MAX_MINUTES     # safety cap in minutes; 0 = keep playing until dismissed
-SHUFFLE=$SHUFFLE          # 1 = pick a different song from $SONGS every time, 0 = always play SONG
+LOOP=$LOOP            # 0 = play the song once and stop on its own, 1 = repeat until you press Space
+MAX_MINUTES=$MAX_MINUTES     # safety cap in minutes; 0 = no cap
+SHUFFLE=$SHUFFLE          # 1 = pick a different song from the songs folder every time, 0 = always play SONG
+
+# Only play once Claude has been quiet this many seconds, so a long task that
+# pauses and carries on does not start a new song each time. 0 = play immediately.
+QUIET_SECONDS=$QUIET_SECONDS
+# 1 = only play after a turn that actually did something (ran tools), not after
+# a plain back-and-forth reply. 0 = play after any turn.
+WORK_ONLY=$WORK_ONLY
 CONF_EOF
 }
+
+logline() { mkdir -p "$APP"; printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$PLAYLOG"; tail -n 200 "$PLAYLOG" > "$PLAYLOG.tmp" 2>/dev/null && mv -f "$PLAYLOG.tmp" "$PLAYLOG"; }
 
 # All playable files sitting in the songs folder, one per line.
 all_songs() {
@@ -89,9 +102,10 @@ resolve_shuffle_pick() {
 }
 
 is_playing() { pgrep -f "$MARK" >/dev/null 2>&1; }
+is_pending() { pgrep -f "$WAITMARK" >/dev/null 2>&1; }
 
-# Kill every player + loop process and their children (afplay, window), race-free.
-do_stop() {
+# Kill the audio + window, race-free. Leaves pending quiet-watchers alone.
+kill_players() {
   local pids kids
   pids=$(pgrep -f "$MARK" 2>/dev/null)
   if [ -n "$pids" ]; then
@@ -103,9 +117,146 @@ do_stop() {
   rm -rf "$RUN"
 }
 
+# Stop everything: the music now, and any song that was waiting to start.
+do_stop() {
+  local w
+  w=$(pgrep -f "$WAITMARK" 2>/dev/null)
+  [ -n "$w" ] && kill -TERM $w 2>/dev/null
+  kill_players
+}
+
+# ---- the Stop hook lands here -------------------------------------------------
+# Don't play yet. Wait until Claude has actually stopped working, so a task that
+# pauses and carries on doesn't start a new song every time it pauses.
+do_arm() {
+  [ -e "$APP/off" ] && exit 0
+  load_conf
+  mkdir -p "$APP"
+
+  local payload transcript
+  payload=$(cat 2>/dev/null)
+  transcript=$(printf '%s' "$payload" | /usr/bin/python3 -c \
+    'import json,sys
+try: print(json.load(sys.stdin).get("transcript_path",""))
+except Exception: print("")' 2>/dev/null)
+  transcript="${transcript/#\~/$HOME}"
+
+  # No quiet period wanted, or no transcript to watch: behave like before.
+  if [ "${QUIET_SECONDS:-0}" -le 0 ] 2>/dev/null || [ ! -f "$transcript" ]; then
+    do_play
+    return
+  fi
+
+  # Supersede any watcher already pending for this session.
+  local key token
+  key=$(basename "$transcript" .jsonl)
+  token="$$-$RANDOM"
+  echo "$token" > "$APP/.pending-$key"
+  perl -e 'use POSIX; POSIX::setsid(); exec @ARGV' -- \
+    "$BIN/claude-song" _wait "$transcript" "$key" "$token" </dev/null >/dev/null 2>&1 &
+  disown 2>/dev/null
+}
+
+# How much real conversation the transcript holds: assistant + user rows only.
+# Claude Code also appends bookkeeping rows (including the summary of this very
+# hook) after a turn ends, so a plain size/mtime check would always look like
+# "still working" and the song would never play.
+tsig() {
+  /usr/bin/python3 - "$1" <<'PY' 2>/dev/null || echo unknown
+import json,sys,os
+p=sys.argv[1]
+try:
+    size=os.path.getsize(p)
+    with open(p,'rb') as f:
+        if size>400000: f.seek(size-400000)
+        data=f.read().decode('utf-8','ignore')
+except Exception:
+    print("unknown"); sys.exit()
+n=0; tools=0
+for line in data.split('\n'):
+    line=line.strip()
+    if not line: continue
+    try: r=json.loads(line)
+    except Exception: continue
+    t=r.get('type')
+    if t in ('assistant','user'):
+        n+=1
+        c=r.get('message',{}).get('content')
+        if isinstance(c,list):
+            tools+=sum(1 for b in c if isinstance(b,dict) and b.get('type')=='tool_use')
+print(f"{n}-{tools}")
+PY
+}
+
+# Did the turn that just ended actually do something (run tools), or was it
+# only a conversational reply? Prints "work" or "talk".
+turn_did_work() {
+  /usr/bin/python3 - "$1" <<'PY' 2>/dev/null || echo work
+import json,sys,os
+p=sys.argv[1]
+try:
+    size=os.path.getsize(p)
+    with open(p,'rb') as f:
+        if size>400000: f.seek(size-400000)
+        rows=[]
+        for line in f.read().decode('utf-8','ignore').split('\n'):
+            line=line.strip()
+            if not line: continue
+            try: rows.append(json.loads(line))
+            except Exception: pass
+except Exception:
+    print("work"); sys.exit()
+
+def is_real_user(r):
+    if r.get('type')!='user': return False
+    c=r.get('message',{}).get('content')
+    if isinstance(c,list):
+        if any(isinstance(b,dict) and b.get('type')=='tool_result' for b in c): return False
+    return True
+
+tools=0
+for r in reversed(rows):
+    if is_real_user(r): break
+    if r.get('type')!='assistant': continue
+    msg=r.get('message',{})
+    if msg.get('stop_reason')=='tool_use': tools+=1; continue
+    c=msg.get('content')
+    if isinstance(c,list) and any(isinstance(b,dict) and b.get('type')=='tool_use' for b in c): tools+=1
+print("work" if tools else "talk")
+PY
+}
+
+# The detached watcher: play only if the session really has gone quiet.
+do_wait() {
+  local transcript="$1" key="$2" token="$3"
+  load_conf
+  local before after
+  before=$(tsig "$transcript")
+  sleep "${QUIET_SECONDS:-25}"
+
+  # A newer turn armed its own watcher: that one owns the decision now.
+  [ "$(cat "$APP/.pending-$key" 2>/dev/null)" = "$token" ] || exit 0
+
+  after=$(tsig "$transcript")
+  if [ "$before" != "$after" ]; then
+    logline "skipped — Claude was still working (quiet ${QUIET_SECONDS}s not reached)"
+    exit 0
+  fi
+  if [ "${WORK_ONLY:-0}" = "1" ] && [ "$(turn_did_work "$transcript")" = "talk" ]; then
+    logline "skipped — that turn was just a reply, no work done"
+    exit 0
+  fi
+  kill_players
+  start_player
+}
+
 do_play() {
   [ -e "$APP/off" ] && exit 0
   do_stop
+  start_player
+}
+
+start_player() {
   mkdir -p "$RUN"
   # Run the player in its own session so it outlives the hook that started it,
   # then wait (up to 3 s) until it confirms it is running before returning.
@@ -148,10 +299,11 @@ show_window() {
 do_player() {
   load_conf
   mkdir -p "$RUN"
-  echo $$ > "$RUN/player.pid"   # signals do_play that we are detached and running
+  echo $$ > "$RUN/player.pid"   # signals start_player that we are detached and running
   local file msg
   if [ "$SHUFFLE" = "1" ]; then file=$(resolve_shuffle_pick); else file=$(resolve_song); fi
   if [ -n "$file" ]; then
+    logline "played — $(basename "$file")"
     (
       while :; do
         afplay -v "$VOLUME" "$file" & wait $!
@@ -178,6 +330,7 @@ Press Space or Enter to stop the music."
     [ "$LOOP" != "1" ] && msg="$msg
 Plays once, then stops on its own."
   else
+    logline "played — no song file found, chime instead"
     ( afplay "$SOUNDS/Glass.aiff"; afplay "$SOUNDS/Hero.aiff" ) &
     msg="No song file found for: ${SONG:-<none set>}
 
@@ -186,7 +339,7 @@ Run:  claude-song add <your-song.mp3>"
   local secs=31536000
   [ "${MAX_MINUTES:-0}" -gt 0 ] 2>/dev/null && secs=$((MAX_MINUTES * 60))
   show_window "$msg" "$secs"
-  do_stop   # window dismissed (Space / Enter / Esc / click / timeout): stop everything, including this loop
+  kill_players   # window dismissed (Space / Enter / Esc / click / timeout): stop everything
 }
 
 do_set() {
@@ -227,8 +380,7 @@ do_add() {
 do_shuffle() {
   load_conf
   case "$1" in
-    ""|status)
-      ;;
+    ""|status) ;;
     on)  SHUFFLE=1; save_conf; rm -f "$LASTSONG" ;;
     off) SHUFFLE=0; save_conf ;;
     *)   echo "usage: claude-song shuffle [on|off]"; exit 1 ;;
@@ -250,14 +402,26 @@ do_status() {
     local n last; n=$(all_songs | grep -v '/default-jingle\.wav$' | grep -c .)
     echo "Setting : SHUFFLE ON — rotating $n song(s) in $SONGS"
     [ -f "$LASTSONG" ] && { last=$(cat "$LASTSONG"); echo "Last    : $(basename "$last")"; }
-    echo "          VOLUME=$VOLUME  LOOP=$LOOP  MAX_MINUTES=$MAX_MINUTES"
   else
-    echo "Setting : SONG=\"$SONG\"  VOLUME=$VOLUME  LOOP=$LOOP  MAX_MINUTES=$MAX_MINUTES"
+    echo "Setting : SONG=\"$SONG\""
     local f; f=$(resolve_song) && echo "File    : $f" || echo "File    : NOT FOUND (will play a short chime instead)"
   fi
+  if [ "$LOOP" = "1" ]; then
+    echo "Length  : repeats until you press Space"
+  else
+    echo "Length  : plays once, then stops on its own"
+  fi
+  if [ "${QUIET_SECONDS:-0}" -gt 0 ] 2>/dev/null; then
+    echo "Waits   : plays only after Claude has been quiet ${QUIET_SECONDS}s$([ "${WORK_ONLY:-0}" = "1" ] && echo ", and only after a turn that ran tools")"
+  else
+    echo "Waits   : no — plays the moment a turn ends"
+  fi
+  echo "          VOLUME=$VOLUME  MAX_MINUTES=$MAX_MINUTES"
   if [ -x "$APP/bin/song-dialog" ] || [ -x "$BIN/song-dialog" ]; then echo "Window  : native (Space / Enter / Esc stop it)"; else echo "Window  : AppleScript fallback (Enter stops it)"; fi
   [ -e "$APP/off" ] && echo "Alert   : OFF (run 'claude-song on' to enable)"
-  if is_playing; then echo "Playing : yes (press Space on the window, or run 'claude-song stop')"; else echo "Playing : no"; fi
+  if is_playing; then echo "Playing : yes (press Space on the window, or run 'claude-song stop')"
+  elif is_pending; then echo "Playing : not yet — waiting for Claude to go quiet"
+  else echo "Playing : no"; fi
 }
 
 do_list() {
@@ -270,16 +434,19 @@ do_list() {
 }
 
 case "$1" in
+  arm)        do_arm ;;
   play|test)  do_play ;;
   _player)    do_player ;;
+  _wait)      do_wait "$2" "$3" "$4" ;;
   stop)       do_stop ;;
   set)        do_set "$2" ;;
   add)        do_add "$2" ;;
   shuffle)    do_shuffle "$2" ;;
   status)     do_status ;;
   list)       do_list ;;
+  log)        tail -n "${2:-15}" "$PLAYLOG" 2>/dev/null || echo "nothing played yet" ;;
   off)        mkdir -p "$APP"; touch "$APP/off"; do_stop; echo "claude-song is OFF. Run 'claude-song on' to enable." ;;
   on)         rm -f "$APP/off"; echo "claude-song is ON." ;;
   config)     echo "$CONF" ;;
-  *)          sed -n '2,14p' "$0"; exit 1 ;;
+  *)          sed -n '2,17p' "$0"; exit 1 ;;
 esac

@@ -2,9 +2,12 @@
 
 **Know the moment Claude Code is done, from anywhere in the room.**
 
-When Claude Code finishes a task, claude-song plays a song of your choice on repeat and pops up a small
-"Claude Code is done" window. Press **Space** (or Enter, Esc, or click) and the music stops.
-Sending your next prompt in Claude Code stops it too.
+When Claude Code finishes, claude-song plays one song of your choice and pops up a small "Claude Code is
+done" window. Press **Space** (or Enter, Esc, or click) and the music stops; it also stops on its own when
+the song ends, and when you send your next prompt.
+
+It waits until Claude is **actually** finished — not at every pause in a long task — so you hear one song at
+the end, not a new one starting every couple of minutes.
 
 Works in every Claude Code window and project on your Mac, because it hooks into Claude Code itself.
 
@@ -68,7 +71,9 @@ claude-song shuffle on
 
 | Command | What it does |
 |---|---|
-| `claude-song play` | Start the song and the window (this is what the Stop hook runs) |
+| `claude-song arm` | What the Stop hook runs: play once the session goes quiet |
+| `claude-song play` | Play right now, without waiting for quiet |
+| `claude-song log` | Why it played, or why it stayed quiet, last few times |
 | `claude-song stop` | Stop the song (this is what the UserPromptSubmit hook runs) |
 | `claude-song add <file>` | Copy a song into the songs folder |
 | `claude-song set <file-or-name>` | Play one fixed song, by path or by part of a filename in the songs folder |
@@ -85,18 +90,28 @@ claude-song shuffle on
 ```bash
 SONG="moonrise"     # a path, or part of a filename inside the songs folder (ignored while SHUFFLE=1)
 VOLUME=1            # 1 = normal, 0.5 = half, 2 = louder
-LOOP=1              # 1 = repeat the current song until you press Space, 0 = play once and stop on its own
-MAX_MINUTES=0       # safety cap in minutes; 0 = keep playing until dismissed
+LOOP=0              # 0 = play the song once and stop on its own, 1 = repeat until you press Space
+MAX_MINUTES=0       # safety cap in minutes; 0 = no cap
 SHUFFLE=0           # 1 = pick a different song from the songs folder every time, 0 = always play SONG
+QUIET_SECONDS=25    # only play once Claude has been quiet this long; 0 = play the moment a turn ends
+WORK_ONLY=1         # 1 = only after a turn that ran tools, not after a plain back-and-forth reply
 ```
 
-Set `LOOP=0` if you'd rather it just play the song once and stop, instead of looping until you dismiss it.
+**Why the wait.** Claude Code ends a turn every time it hands back to you, which during a long task can be
+seconds apart. Playing on every one of those means a new song starting over and over. `QUIET_SECONDS` makes
+it wait until Claude is actually finished, so you get one song at the end instead of music all the way
+through. Set it to `0` for the old behaviour.
 
 ## How it works
 
-- A **Stop** hook in Claude Code runs `claude-song play`. It starts a detached player that loops the song with
-  `afplay` and shows the window. The window is a tiny native macOS app (Swift, `bin/song-dialog.swift`) that
-  takes keyboard focus and exits on Space, Enter, Esc, click, or close. When it exits, the music stops.
+- A **Stop** hook in Claude Code runs `claude-song arm` each time a turn ends. It does **not** play straight
+  away: it starts a detached watcher that waits for the session to go quiet (`QUIET_SECONDS`, 25 by default)
+  by watching the session transcript. If Claude carries on working, or you send another prompt, the watcher
+  exits silently. Only when the session is really finished does the song play, once. That way a long task
+  that pauses and resumes doesn't start a new song every time it pauses.
+- When it does play, a detached player runs the song with `afplay` and shows the window. The window is a tiny
+  native macOS app (Swift, `bin/song-dialog.swift`) that takes keyboard focus and exits on Space, Enter, Esc,
+  click, or close. When it exits, the music stops.
 - A **UserPromptSubmit** hook runs `claude-song stop`, so typing your next prompt silences it.
 - The installer compiles the window locally when the Xcode Command Line Tools are present, otherwise it uses the
   prebuilt universal binary in `bin/`. If neither can run, an AppleScript dialog appears instead and Enter stops
